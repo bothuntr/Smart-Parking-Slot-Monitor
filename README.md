@@ -145,7 +145,3 @@ README.md
 - A `/status` bot command showing free slots
 - A small server for ticket storage
 - A waterproof sensor (JSN-SR04T) for outdoor use
-
-## License
-
-Add a license of your choice, for example MIT.
