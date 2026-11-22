@@ -7,6 +7,7 @@ An ESP32-based parking slot monitor. An ultrasonic sensor detects when a vehicle
 - Ultrasonic vehicle detection (HC-SR04) on an ESP32
 - **RFID driver identification (RC522)**: after a car is detected, the driver has 30 s to tap a registered card, and the ticket shows the owner's name and card ID
 - Cards are registered from the Serial Monitor and stored in flash (NVS). Unregistered cards and missed taps get a clearly marked "Guest" ticket
+- **Per-driver Telegram delivery**: each card is linked to its own Telegram chat ID, so a driver's ticket and receipt go only to their account. Unregistered cards and missed taps go to a separate guest (test) chat
 - Configurable confirmation window (default 5 s) to ignore people or objects passing by
 - Faster departure confirmation (2 s), so the light turns green and the receipt goes out quickly after the car leaves
 - Readings below 2 cm are rejected as sensor glitches
@@ -147,7 +148,7 @@ All boards use 3.3 V logic, so no level shifting is needed.
    - **ArduinoJson** (version 7 or newer)
    - **MFRC522** by GithubCommunity (not *MFRC522v2*, which has a different API)
 
-4. Create a Telegram bot with [@BotFather](https://t.me/BotFather) and note the bot token. Get your chat ID by messaging the bot and opening `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+4. Create a Telegram bot with [@BotFather](https://t.me/BotFather) and note the bot token. Get your chat ID by messaging the bot and opening `https://api.telegram.org/bot<TOKEN>/getUpdates`. This is the **admin chat**. Every driver who should get their own messages must also open the bot and press **Start** (or send any message). Their chat ID appears in the same `getUpdates` page.
 5. Open `esp32_parking.ino` and set the setup portal password:
 
    ```
@@ -175,8 +176,9 @@ Open the Serial Monitor at 115200 baud, type the letter, and press Enter.
 |---------|-------------------------------------------------------------|
 | `c`     | Reopen the setup portal                                     |
 | `s`     | Print the current settings and the RFID reader status       |
-| `r`     | Register a card: tap it, then type the owner name           |
-| `l`     | List the registered cards                                   |
+| `r`     | Register a card: tap it, then type the owner name and chat ID |
+| `l`     | List the registered cards and their chat IDs                |
+| `g`     | Set the guest chat ID for unregistered cards                |
 | `x`     | Delete all registered cards (you must type `YES` to confirm)|
 
 ### Registering RFID cards
@@ -184,7 +186,20 @@ Open the Serial Monitor at 115200 baud, type the letter, and press Enter.
 1. Send `r` in the Serial Monitor.
 2. Tap the card on the reader within 20 s. The card's UID is printed.
 3. Type the owner's name (up to 24 characters) and press Enter within 30 s.
-4. The card is saved in flash. Tapping a registered card again with `r` renames it.
+4. Type the owner's Telegram chat ID and press Enter, or type `-` to send that card's messages to the admin chat.
+5. The card is saved in flash. Registering the same card again with `r` updates its name and chat ID.
+
+### Where messages go
+
+| Who taps | Ticket and receipt go to |
+|---|---|
+| A registered card | That card's own Telegram chat |
+| A registered card with no chat ID | The admin chat (the one set in the portal) |
+| An unregistered card, or no tap | The guest chat set with `g` (the admin chat if none is set) |
+
+If a message can't be delivered (for example the driver never pressed Start on the bot), it is sent to the admin chat instead, marked as not delivered.
+
+Set the guest chat once from the Serial Monitor: send `g`, then type the chat ID of the account you want to use for unregistered cards (type `-` to clear it).
 
 Up to 10 cards can be stored. Use cards or tags that operate at **13.56 MHz** (MIFARE). 125 kHz tags and most phones will not work.
 
@@ -199,7 +214,7 @@ If the Serial Monitor shows "Permission denied" on `/dev/ttyUSB0`, add your user
 1. The ESP32 connects to WiFi (through the portal on first run), syncs its clock over NTP, and checks that the RC522 reader responds.
 2. Every 200 ms it measures the distance to the nearest object. A reading with no echo is ignored, not treated as an empty slot, and readings below 2 cm are rejected as glitches.
 3. If the distance stays below the arrival threshold for the confirmation time, a car is parked. The ESP32 sets GPIO23 HIGH (red LED on the Pico), saves the occupied flag and entry time, and starts a 30 s card window.
-4. The driver taps a card on the RC522. A registered card issues the ticket with the owner's name and card ID. An unregistered card, or no tap before the window ends, issues a "Guest" ticket. The ticket counter is incremented and saved only when the ticket is issued.
+4. The driver taps a card on the RC522. A registered card issues the ticket with the owner's name and card ID, sent to that owner's Telegram chat. An unregistered card, or no tap before the window ends, issues a "Guest" ticket. The ticket counter is incremented and saved only when the ticket is issued.
 5. If the car leaves before the ticket is issued, no ticket or receipt is sent.
 6. Once parked, the car only counts as gone when the distance rises above the departure threshold for 2 s. The gap between the two thresholds is the hysteresis.
 7. On departure, the ESP32 sets GPIO23 LOW (green LED), calculates the fee, and sends the receipt with the same owner and card as the ticket.
@@ -226,7 +241,8 @@ Raise the two thresholds, keeping a gap of a few cm, for a real slot. The thresh
 - It detects any solid object, not specifically cars. The RFID card identifies the driver but is not checked against the vehicle.
 - A card UID can be copied, so RFID here is identification for a demo, not secure authentication. Anyone with a registered card can tap it.
 - The RC522 reads only within about 3 cm, so it must be mounted where the driver can tap a card by hand.
-- Cards are registered through the Serial Monitor (max 10), and the UID and name pairs are stored unencrypted in the ESP32's flash.
+- Cards are registered through the Serial Monitor (max 10), and the UID, name and chat ID are stored unencrypted in the ESP32's flash.
+- A driver's own Telegram messages only work after they have pressed Start on the bot. Otherwise Telegram rejects the message (it appears in the Serial log) and the message is sent to the admin chat instead.
 - The ticket is sent only after the card tap or after the 30 s window, so it can arrive up to 30 s after the car is detected.
 - Without a surface in front of the sensor, an empty slot gives no echo, and no-echo readings are ignored. Departure can then be delayed until a valid far reading comes back.
 - The HTTPS connection uses `setInsecure()`, which skips certificate validation. This is fine for a demo, but a real deployment should pin the Telegram certificate.
@@ -242,3 +258,4 @@ Raise the two thresholds, keeping a gap of a few cm, for a real slot. The thresh
 - A `/status` bot command showing free slots
 - A small server for ticket storage
 - A waterproof sensor (JSN-SR04T) for outdoor use
+
