@@ -1,6 +1,7 @@
 // Smart Parking Slot Monitor - ESP32 firmware
 // ESP32 + HC-SR04 vehicle detection, RC522 RFID card identification,
-// Telegram tickets and receipts. See README.md for wiring and setup.
+// Telegram tickets and receipts, plus a web dashboard served by the ESP32
+// (http://parking.local/). See README.md for wiring and setup.
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -13,6 +14,8 @@
 #include <stdlib.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 
 // =====================================================
 // 1. CONFIGURATION
@@ -25,7 +28,7 @@ const char* CHAT_ID   = "";
 
 // WiFiManager access point
 const char* AP_NAME = "Parking-Setup";
-const char* AP_PASSWORD = "change-this-password";   // min. 8 characters
+const char* AP_PASSWORD = "parksetup123";   // min. 8 characters
 
 // Hardware pins
 static constexpr uint8_t TRIG_PIN = 5;
@@ -65,6 +68,10 @@ static constexpr float MIN_VALID_CM = 2.0f;
 static constexpr uint32_t CARD_WINDOW_MS = 30000;  // time to tap after arrival
 static constexpr uint32_t RFID_POLL_MS = 80;
 static constexpr uint8_t MAX_CARDS = 10;
+
+// Web dashboard
+static const char* const DEFAULT_DASH_PIN = "7683";   // change it in the dashboard Settings
+static constexpr uint32_t SCAN_WINDOW_MS = 30000;     // dashboard "Scan card" time limit
 
 // =====================================================
 // 2. CONFIGURATION STORAGE
@@ -113,6 +120,16 @@ uint32_t pendingStart = 0;
 uint32_t lastRfidPoll = 0;
 String sessionOwner = "";        // owner of the current parking session
 String sessionCard = "";         // card UID of the current session
+String sessionChat = "";         // Telegram chat ID of the session owner
+bool sessionFree = false;       // registered card: parking is not charged
+String guestChat = "";           // chat for unregistered cards and guests
+
+// Web dashboard state
+WebServer server(80);
+String dashPin = DEFAULT_DASH_PIN;
+bool scanActive = false;
+uint32_t scanStart = 0;
+String scanUid = "";
 
 // =====================================================
 // 4. CONFIGURATION LOAD/SAVE
@@ -377,14 +394,14 @@ String fmtDuration(uint64_t seconds) {
 // 7. TELEGRAM MESSAGING
 // =====================================================
 
-bool sendTelegram(const String& message) {
+bool sendTelegramTo(const String& targetChat, const String& message) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[TELEGRAM] ERROR: WiFi disconnected.");
     return false;
   }
 
   if (cfg.botToken.length() == 0 ||
-      cfg.chatId.length() == 0) {
+      targetChat.length() == 0) {
     Serial.println("[TELEGRAM] ERROR: Missing bot token/chat ID.");
     Serial.println("[TELEGRAM] Check BOT_TOKEN and CHAT_ID.");
     return false;
@@ -419,7 +436,7 @@ bool sendTelegram(const String& message) {
 
   JsonDocument doc;
 
-  doc["chat_id"] = cfg.chatId;
+  doc["chat_id"] = targetChat;
   doc["text"] = message;
 
   String body;
@@ -455,6 +472,30 @@ bool sendTelegram(const String& message) {
     : "[TELEGRAM] Notification failed.");
 
   return success;
+}
+
+// Sends to the admin chat configured in the setup portal.
+bool sendTelegram(const String& message) {
+  return sendTelegramTo(cfg.chatId, message);
+}
+
+// Routes a ticket or receipt to one chat:
+//   registered card  -> that card's chat (or the admin chat if none was set)
+//   guest / unknown  -> the guest chat (set with the g command), else admin
+// If delivery fails, the admin chat gets the message instead.
+void routeMessage(const String& targetChat, const String& message) {
+  String target = targetChat;
+
+  if (target.length() == 0) {
+    target = guestChat.length() > 0 ? guestChat : cfg.chatId;
+  }
+
+  bool ok = sendTelegramTo(target, message);
+
+  if (!ok && target != cfg.chatId) {
+    Serial.println("[TELEGRAM] Delivery failed; sending to the admin chat.");
+    sendTelegram("[Not delivered to chat " + target + "]\n" + message);
+  }
 }
 
 // =====================================================
@@ -504,6 +545,9 @@ void restoreParkingState() {
 
   sessionOwner = prefs.isKey("owner") ? prefs.getString("owner", "") : "";
   sessionCard = prefs.isKey("ownuid") ? prefs.getString("ownuid", "") : "";
+  sessionChat = prefs.isKey("ownchat") ? prefs.getString("ownchat", "") : "";
+  sessionFree = prefs.isKey("ownfree") && prefs.getBool("ownfree", false);
+  guestChat = prefs.isKey("guestchat") ? prefs.getString("guestchat", "") : "";
   pendingTicket = parked && prefs.isKey("pend") && prefs.getBool("pend", false);
   pendingStart = millis();
 
@@ -591,7 +635,17 @@ String cardOwner(const String& uid) {
   return cardField("cname", (uint8_t)slot);
 }
 
-bool saveCard(const String& uid, const String& name) {
+String cardChat(const String& uid) {
+  int slot = findCard(uid);
+
+  if (slot < 0) {
+    return "";
+  }
+
+  return cardField("cchat", (uint8_t)slot);
+}
+
+bool saveCard(const String& uid, const String& name, const String& chat) {
   int slot = findCard(uid);
 
   if (slot < 0) {
@@ -610,8 +664,11 @@ bool saveCard(const String& uid, const String& name) {
   String uidKey = String("cuid") + String(slot);
   String nameKey = String("cname") + String(slot);
 
+  String chatKey = String("cchat") + String(slot);
+
   prefs.putString(uidKey.c_str(), uid);
   prefs.putString(nameKey.c_str(), name);
+  prefs.putString(chatKey.c_str(), chat);
 
   return true;
 }
@@ -629,7 +686,15 @@ void listCards() {
     }
 
     any = true;
-    Serial.println(uid + " -> " + cardField("cname", i));
+    String chat = cardField("cchat", i);
+
+    if (chat.length() > 0) {
+      Serial.println(uid + " -> " + cardField("cname", i) +
+                     "  (Telegram chat " + chat + ")");
+    } else {
+      Serial.println(uid + " -> " + cardField("cname", i) +
+                     "  (admin chat)");
+    }
   }
 
   if (!any) {
@@ -650,6 +715,12 @@ void clearCards() {
 
     if (prefs.isKey(nameKey.c_str())) {
       prefs.remove(nameKey.c_str());
+    }
+
+    String chatKey = String("cchat") + String(i);
+
+    if (prefs.isKey(chatKey.c_str())) {
+      prefs.remove(chatKey.c_str());
     }
   }
 }
@@ -683,7 +754,29 @@ String readSerialLine(uint32_t timeoutMs) {
   return "";
 }
 
-// Serial command 'r': tap a card, then type the owner name.
+// Telegram chat IDs are whole numbers (negative for groups).
+bool isValidChatId(const String& s) {
+  if (s.length() < 5) {
+    return false;
+  }
+
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char ch = s[i];
+
+    if (i == 0 && ch == '-') {
+      continue;
+    }
+
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Serial command 'r': tap a card, type the owner name,
+// then type the owner's Telegram chat ID.
 void registerCardFlow() {
   if (!rfidOk) {
     Serial.println("[RFID] Reader not detected; cannot register cards.");
@@ -731,8 +824,39 @@ void registerCardFlow() {
     return;
   }
 
-  if (saveCard(uid, name)) {
+  String chat = "";
+  bool chatOk = false;
+
+  for (uint8_t attempt = 0; attempt < 3 && !chatOk; attempt++) {
+    Serial.println("[RFID] Type the owner's Telegram chat ID, or - to use "
+                   "the admin chat (30 s)...");
+
+    chat = readSerialLine(30000UL);
+
+    if (chat == "-") {
+      chat = "";
+      chatOk = true;
+    } else if (isValidChatId(chat)) {
+      chatOk = true;
+    } else {
+      Serial.println("[RFID] A chat ID is a number, for example 123456789.");
+    }
+  }
+
+  if (!chatOk) {
+    Serial.println("[RFID] No valid chat ID entered. Cancelled.");
+    return;
+  }
+
+  if (saveCard(uid, name, chat)) {
     Serial.println("[RFID] Saved: " + uid + " -> " + name);
+
+    if (chat.length() > 0) {
+      Serial.println("[RFID] Messages for this card go to chat " + chat +
+                     " (the owner must have started the bot).");
+    } else {
+      Serial.println("[RFID] Messages for this card go to the admin chat.");
+    }
   } else {
     Serial.println("[RFID] Card list is full (max 10). Use x to clear.");
   }
@@ -744,15 +868,23 @@ void registerCardFlow() {
 
 void issueTicket(const String& owner,
                  const String& uid,
-                 const String& cardText) {
+                 const String& cardText,
+                 const String& ownerChat) {
   pendingTicket = false;
   prefs.putBool("pend", false);
 
   sessionOwner = owner;
   sessionCard = uid;
 
+  sessionChat = ownerChat;
+
+  // Registered cards park free; guests and unregistered cards are charged.
+  sessionFree = findCard(uid) >= 0;
+  prefs.putBool("ownfree", sessionFree);
+
   prefs.putString("owner", sessionOwner);
   prefs.putString("ownuid", sessionCard);
+  prefs.putString("ownchat", sessionChat);
 
   ticketNo++;
   prefs.putUInt("ticket", ticketNo);
@@ -763,10 +895,14 @@ void issueTicket(const String& owner,
     "\nCard: " + cardText +
     "\nSlot: " + cfg.slot +
     "\nEntry: " + fmtTime(entryTime) +
-    "\nFare: INR " + String(cfg.ratePerHour) +
-    " per started hour";
+    (sessionFree
+      ? String("\nFare: No charge (registered card)")
+      : "\nFare: INR " + String(cfg.ratePerHour) + " per started hour") +
+    (sessionFree
+      ? "\nDashboard: http://" + WiFi.localIP().toString() + "/"
+      : String(""));
 
-  sendTelegram(message);
+  routeMessage(sessionChat, message);
 }
 
 void handleArrival() {
@@ -778,14 +914,18 @@ void handleArrival() {
 
   sessionOwner = "";
   sessionCard = "";
+  sessionChat = "";
   prefs.putString("owner", "");
   prefs.putString("ownuid", "");
+  prefs.putString("ownchat", "");
+  sessionFree = false;
+  prefs.putBool("ownfree", false);
 
   Serial.println("[PARKING] Vehicle arrival confirmed.");
 
   if (!rfidOk) {
     // No reader available: issue the ticket straight away.
-    issueTicket("Guest", "", "reader unavailable");
+    issueTicket("Guest", "", "reader unavailable", "");
     return;
   }
 
@@ -803,12 +943,18 @@ void updateRfid() {
     return;
   }
 
+  // A dashboard card scan owns the reader; keep the ticket window open meanwhile.
+  if (scanActive) {
+    pendingStart = millis();
+    return;
+  }
+
   const uint32_t now = millis();
 
   if (!rfidOk ||
       (uint32_t)(now - pendingStart) >= CARD_WINDOW_MS) {
     Serial.println("[RFID] No card tapped; issuing guest ticket.");
-    issueTicket("Guest", "", "no card tapped");
+    issueTicket("Guest", "", "no card tapped", "");
     return;
   }
 
@@ -828,10 +974,16 @@ void updateRfid() {
 
   if (owner.length() > 0) {
     Serial.println("[RFID] Card " + uid + " belongs to " + owner);
-    issueTicket(owner, uid, uid);
+    String ownerChat = cardChat(uid);
+
+    if (ownerChat.length() == 0) {
+      ownerChat = cfg.chatId;
+    }
+
+    issueTicket(owner, uid, uid, ownerChat);
   } else {
     Serial.println("[RFID] Unregistered card: " + uid);
-    issueTicket("Guest", uid, uid + " (unregistered)");
+    issueTicket("Guest", uid, uid + " (unregistered)", "");
   }
 }
 
@@ -854,8 +1006,12 @@ void handleDeparture() {
 
     sessionOwner = "";
     sessionCard = "";
+    sessionChat = "";
     prefs.putString("owner", "");
     prefs.putString("ownuid", "");
+    prefs.putString("ownchat", "");
+    sessionFree = false;
+    prefs.putBool("ownfree", false);
 
     Serial.println("[PARKING] Vehicle left before a ticket was issued.");
     return;
@@ -874,7 +1030,7 @@ void handleDeparture() {
     hours = 1;
   }
 
-  uint64_t fee = hours * (uint64_t)cfg.ratePerHour;
+  uint64_t fee = sessionFree ? 0ULL : hours * (uint64_t)cfg.ratePerHour;
 
   Serial.println("[PARKING] Vehicle departure confirmed.");
 
@@ -889,18 +1045,24 @@ void handleDeparture() {
     "\nEntry: " + fmtTime(entryTime) +
     "\nExit: " + fmtTime(exitTime) +
     "\nDuration: " + fmtDuration(seconds) +
-    "\nBillable hours: " + String((unsigned long)hours) +
-    "\nFee: INR " + String((unsigned long)fee);
+    (sessionFree
+      ? String("\nFee: No charge (registered card)")
+      : "\nBillable hours: " + String((unsigned long)hours) +
+        "\nFee: INR " + String((unsigned long)fee));
 
-  sendTelegram(message);
+  routeMessage(sessionChat, message);
 
   entryTime = 0;
   prefs.putULong64("entry", 0);
 
   sessionOwner = "";
   sessionCard = "";
+  sessionChat = "";
   prefs.putString("owner", "");
   prefs.putString("ownuid", "");
+  prefs.putString("ownchat", "");
+  sessionFree = false;
+  prefs.putBool("ownfree", false);
 }
 
 // =====================================================
@@ -983,6 +1145,14 @@ void updateParkingDetection() {
         ? "CONNECTED"
         : "DISCONNECTED"
     );
+
+    // Dashboard address, printed after every distance line.
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("[WEB] Dashboard: http://" +
+                     WiFi.localIP().toString() + "/");
+    } else {
+      Serial.println("[WEB] Dashboard: unavailable (WiFi disconnected)");
+    }
   }
 }
 
@@ -999,6 +1169,7 @@ void handleSerialCommands() {
 
   if (command == 'c' || command == 'C') {
     Serial.println("[CONFIG] Opening setup portal...");
+    server.stop();   // the portal needs port 80
 
     if (configureWiFi(true)) {
       Serial.println("[CONFIG] Settings updated.");
@@ -1006,6 +1177,7 @@ void handleSerialCommands() {
       Serial.println("[CONFIG] Portal failed or settings invalid.");
     }
 
+    server.begin();
     sensorInitialized = false;
     lastSensorRead = millis();
   }
@@ -1039,6 +1211,10 @@ void handleSerialCommands() {
       ? "RFID reader: OK"
       : "RFID reader: NOT DETECTED");
 
+    Serial.println(guestChat.length() > 0
+      ? "Guest chat: SET"
+      : "Guest chat: not set (guests use the admin chat)");
+
     Serial.println("---------------------------------");
   }
 
@@ -1050,6 +1226,30 @@ void handleSerialCommands() {
 
   if (command == 'l' || command == 'L') {
     listCards();
+  }
+
+  if (command == 'g' || command == 'G') {
+    Serial.println("[RFID] Type the Telegram chat ID for unregistered cards "
+                   "and guests, or - to clear it (30 s)...");
+
+    String id = readSerialLine(30000UL);
+
+    if (id == "-") {
+      guestChat = "";
+      prefs.putString("guestchat", "");
+      Serial.println("[RFID] Guest chat cleared; guests use the admin chat.");
+    } else if (isValidChatId(id)) {
+      guestChat = id;
+      prefs.putString("guestchat", guestChat);
+      Serial.println("[RFID] Guest chat saved: " + guestChat);
+    } else if (id.length() == 0) {
+      Serial.println("[RFID] No chat ID entered. Cancelled.");
+    } else {
+      Serial.println("[RFID] A chat ID is a number, for example 123456789.");
+    }
+
+    sensorInitialized = false;
+    lastSensorRead = millis();
   }
 
   if (command == 'x' || command == 'X') {
@@ -1067,6 +1267,807 @@ void handleSerialCommands() {
 
     sensorInitialized = false;
     lastSensorRead = millis();
+  }
+}
+
+// =====================================================
+// 13B. WEB DASHBOARD (served by the ESP32 itself)
+// =====================================================
+// Open http://parking.local/ or http://<ESP32-IP>/ on the same WiFi.
+// The page is public, but every /api call needs the dashboard PIN
+// (header X-Pin). Default PIN: DEFAULT_DASH_PIN - change it in Settings.
+
+static const char DASH_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parking dashboard</title>
+<style>
+:root{
+  --bg:#e8ecef; --panel:#ffffff; --ink:#1c2630; --muted:#5b6874; --line:#cfd6dc;
+  --accent:#0a5cff; --accent-ink:#ffffff; --free:#17825a; --occ:#c2362b; --asphalt:#39424b; --paint:#f2f4f6;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#171c21; --panel:#222a31; --ink:#e7ecf0; --muted:#9aa7b2; --line:#36414a;
+        --accent:#5b97ff; --accent-ink:#0b1320; --free:#43c28f; --occ:#ee6a5e; --asphalt:#2c343b; --paint:#cfd6dc;}
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 "Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:20px 20px 8px;max-width:1100px;margin:0 auto}
+h1{margin:0;font-size:1.5rem;font-weight:700;letter-spacing:-.01em}
+h2{margin:0 0 12px;font-size:1.05rem;font-weight:700}
+.net{color:var(--muted);font-size:.9rem}
+main{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));padding:12px 20px 40px;max-width:1100px;margin:0 auto}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}
+.wide{grid-column:1/-1}
+.bay{position:relative;height:190px;border-radius:8px;background:var(--asphalt);border:2px dashed var(--paint);display:flex;align-items:center;justify-content:center;overflow:hidden}
+.bay .car{position:absolute;width:58%;height:68%;border-radius:22px 22px 12px 12px;background:var(--occ);box-shadow:inset 0 -10px 0 rgba(0,0,0,.18);transform:translateY(130%);transition:transform .5s ease}
+.bay .car::before{content:"";position:absolute;left:14%;right:14%;top:14%;height:30%;border-radius:10px;background:rgba(255,255,255,.55)}
+.bay.occupied .car{transform:translateY(0)}
+.bay .tag{position:relative;z-index:1;color:var(--paint);font-weight:700;font-size:1.6rem;text-shadow:0 1px 3px rgba(0,0,0,.5)}
+.bay.free .tag{color:#fff}
+.facts{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:14px 0 0}
+.facts dt{color:var(--muted)} .facts dd{margin:0;font-weight:600;word-break:break-word}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.85rem;font-weight:600;background:var(--line);color:var(--ink)}
+.pill.ok{background:var(--free);color:#fff} .pill.bad{background:var(--occ);color:#fff}
+.banner{margin:12px 0 0;padding:10px 12px;border-radius:8px;background:rgba(10,92,255,.12);border:1px solid var(--accent);font-weight:600}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--muted);font-weight:600;font-size:.9rem}
+td.uid{font-family:ui-monospace,Consolas,monospace;font-size:.92rem}
+.empty{color:var(--muted);padding:10px 0}
+form{display:grid;gap:12px}
+.row{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+label{display:grid;gap:4px;font-size:.9rem;color:var(--muted)}
+input{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:9px 10px;min-width:0}
+input:focus-visible,button:focus-visible{outline:3px solid var(--accent);outline-offset:1px}
+.hint{font-size:.85rem;color:var(--muted);margin:-4px 0 0}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+button{font:inherit;font-weight:600;border-radius:7px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:9px 14px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+button.danger{color:var(--occ);border-color:var(--occ)}
+button.small{padding:5px 10px;font-size:.88rem}
+button:disabled{opacity:.55;cursor:default}
+#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(120px);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:8px;font-weight:600;transition:transform .25s ease;max-width:90vw;z-index:5}
+#toast.show{transform:translateX(-50%) translateY(0)}
+#toast.err{background:var(--occ);color:#fff}
+dialog{border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);padding:20px;max-width:340px;width:90vw}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+@media (prefers-reduced-motion:reduce){.bay .car,#toast{transition:none}}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Parking dashboard</h1>
+  <div class="net" id="net">Connecting…</div>
+</header>
+
+<main>
+  <section>
+    <h2>Slot status</h2>
+    <div class="bay free" id="bay"><div class="car"></div><div class="tag" id="bayTag">Free</div></div>
+    <div class="banner" id="pendingBanner" hidden></div>
+    <dl class="facts">
+      <dt>Distance</dt><dd id="dist">–</dd>
+      <dt>Parked by</dt><dd id="owner">–</dd>
+      <dt>Card</dt><dd id="card">–</dd>
+      <dt>Billing</dt><dd id="bill">–</dd>
+      <dt>Entry</dt><dd id="entry">–</dd>
+      <dt>Parked for</dt><dd id="elapsed">–</dd>
+      <dt>Last ticket</dt><dd id="ticket">–</dd>
+      <dt>RFID reader</dt><dd id="rfid">–</dd>
+      <dt>Telegram</dt><dd id="tg">–</dd>
+    </dl>
+    <div class="actions" style="margin-top:14px">
+      <button id="btnTest">Send test message</button>
+      <button id="btnReboot" class="danger">Restart device</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Cards on the device <span class="pill" id="cardCount"></span></h2>
+    <div id="cardList"></div>
+    <hr style="border:none;border-top:1px solid var(--line);margin:16px 0">
+    <h2>Save a card</h2>
+    <form id="cardForm" autocomplete="off">
+      <div class="actions">
+        <button type="button" id="btnScan">Scan card on reader</button>
+        <span class="hint" id="scanMsg" style="margin:0"></span>
+      </div>
+      <div class="row">
+        <label>Card ID<input id="cUid" placeholder="e.g. 04A1B2C3" required></label>
+        <label>Owner name<input id="cName" maxlength="31" placeholder="e.g. Asha" required></label>
+      </div>
+      <label>Owner's Telegram chat ID
+        <input id="cChat" inputmode="numeric" placeholder="Leave empty to use the admin chat">
+      </label>
+      <p class="hint">The owner must have pressed Start in your bot before messages can reach them. Registered cards park free of charge. Saving a card ID that already exists renames it.</p>
+      <div class="actions"><button class="primary" type="submit">Save card</button></div>
+    </form>
+  </section>
+
+  <section class="wide">
+    <h2>Settings</h2>
+    <form id="cfgForm" autocomplete="off">
+      <div class="row">
+        <label>Parking slot<input id="fSlot" maxlength="15" required></label>
+        <label>User name<input id="fUser" maxlength="39" required></label>
+        <label>Fare per started hour (INR)<input id="fRate" type="number" min="0" max="1000000" required></label>
+      </div>
+      <div class="row">
+        <label>Arrival threshold (cm)<input id="fCar" type="number" step="0.1" min="2" max="350" required></label>
+        <label>Departure threshold (cm)<input id="fClear" type="number" step="0.1" min="3" max="400" required></label>
+        <label>Arrival confirmation (ms)<input id="fConfirm" type="number" min="500" max="60000" required></label>
+      </div>
+      <div class="row">
+        <label>Admin Telegram chat ID<input id="fChat" inputmode="numeric"></label>
+        <label>Guest chat ID<input id="fGuest" inputmode="numeric" placeholder="Empty = use admin chat"></label>
+        <label>Bot token<input id="fToken" type="password" placeholder="Leave empty to keep the saved token"></label>
+        <label>New dashboard PIN<input id="fPin" type="password" minlength="4" maxlength="12" placeholder="Leave empty to keep"></label>
+      </div>
+      <div class="actions"><button class="primary" type="submit">Save settings</button></div>
+    </form>
+  </section>
+</main>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<dialog id="pinDlg">
+  <form method="dialog" id="pinForm">
+    <h2>Dashboard PIN</h2>
+    <label>Enter the PIN<input id="pinInput" type="password" autocomplete="current-password" required></label>
+    <div class="actions" style="margin-top:12px"><button class="primary" type="submit">Unlock</button></div>
+  </form>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+let pin = sessionStorage.getItem('pin') || '';
+let pinWait = null;
+let clockOffset = 0;
+
+function toast(msg, isErr) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'show' + (isErr ? ' err' : '');
+  clearTimeout(toast.h);
+  toast.h = setTimeout(() => { t.className = ''; }, 3200);
+}
+
+function askPin() {
+  if (pinWait) return pinWait;
+  pinWait = new Promise(resolve => {
+    const dlg = $('#pinDlg');
+    $('#pinInput').value = '';
+    dlg.showModal();
+    $('#pinForm').onsubmit = () => {
+      pin = $('#pinInput').value;
+      sessionStorage.setItem('pin', pin);
+      pinWait = null;
+      resolve();
+    };
+  });
+  return pinWait;
+}
+
+async function api(path, opt) {
+  opt = Object.assign({}, opt);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const headers = Object.assign({}, opt.headers, { 'X-Pin': pin });
+    let body = opt.body;
+    if (body && typeof body !== 'string') {
+      body = JSON.stringify(body);
+      headers['Content-Type'] = 'application/json';
+    }
+    const r = await fetch(path, { method: opt.method || 'GET', headers, body });
+    if (r.status === 401) { await askPin(); continue; }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('Request failed (' + r.status + ')'));
+    return j;
+  }
+  throw new Error('PIN rejected');
+}
+
+function fmtDur(s) {
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return (h ? h + ' h ' : '') + (h || m ? m + ' min ' : '') + sec + ' s';
+}
+
+let last = null;
+function renderStatus(d) {
+  last = d;
+  clockOffset = d.now - Date.now() / 1000;
+  document.title = 'Slot ' + d.slot + ' · Parking';
+  $('#title').textContent = 'Slot ' + d.slot + ' · ' + d.user;
+  $('#net').textContent = d.ssid + ' · ' + d.ip + ' · ' + d.rssi + ' dBm';
+  $('#bay').className = 'bay ' + (d.parked ? 'occupied' : 'free');
+  $('#bayTag').textContent = d.parked ? 'Occupied' : 'Free';
+  $('#dist').textContent = d.distance === null ? 'No echo' : d.distance.toFixed(1) + ' cm';
+  $('#owner').textContent = d.parked ? (d.pending ? 'Waiting for card tap' : (d.owner || 'Guest')) : '–';
+  $('#card').textContent = d.parked && d.card ? d.card : '–';
+  $('#bill').textContent = d.parked && !d.pending ? (d.free ? 'No charge (registered card)' : 'INR ' + d.rate + ' per started hour') : '–';
+  $('#entry').textContent = d.parked && d.entryText ? d.entryText : '–';
+  $('#ticket').textContent = '#' + d.ticket;
+  $('#rfid').innerHTML = d.rfidOk ? '<span class="pill ok">Detected</span>' : '<span class="pill bad">Not detected</span>';
+  $('#tg').innerHTML = (d.botSet && d.chatSet) ? '<span class="pill ok">Configured</span>' : '<span class="pill bad">Missing token or chat ID</span>';
+  const b = $('#pendingBanner');
+  b.hidden = !d.pending;
+  if (d.pending) b.textContent = 'Car detected. Tap a card on the reader within ' + d.pendingLeft + ' s to issue the ticket.';
+  tickElapsed();
+}
+function tickElapsed() {
+  if (!last || !last.parked || !last.entry || !last.timeOk) { $('#elapsed').textContent = '–'; return; }
+  $('#elapsed').textContent = fmtDur(Date.now() / 1000 + clockOffset - last.entry);
+}
+setInterval(tickElapsed, 1000);
+
+async function pollStatus() {
+  try {
+    if (!pinWait) renderStatus(await api('/api/status'));
+  } catch (e) {
+    $('#net').textContent = 'Device not reachable';
+  }
+  setTimeout(pollStatus, 1500);
+}
+
+async function loadCards() {
+  try {
+    const d = await api('/api/cards');
+    $('#cardCount').textContent = d.cards.length + ' of ' + d.max;
+    const box = $('#cardList');
+    if (!d.cards.length) { box.innerHTML = '<div class="empty">No cards saved yet. Tickets go to the guest chat until you add one.</div>'; return; }
+    const rows = d.cards.map(c =>
+      '<tr><td class="uid"></td><td class="nm"></td><td class="ch"></td><td><button class="small danger" data-uid="">Delete</button></td></tr>');
+    box.innerHTML = '<table><thead><tr><th>Card ID</th><th>Owner</th><th>Chat</th><th></th></tr></thead><tbody>' + rows.join('') + '</tbody></table>';
+    box.querySelectorAll('tbody tr').forEach((tr, i) => {
+      const c = d.cards[i];
+      tr.querySelector('.uid').textContent = c.uid;
+      tr.querySelector('.nm').textContent = c.name;
+      tr.querySelector('.ch').textContent = c.chat || 'Admin chat';
+      const btn = tr.querySelector('button');
+      btn.dataset.uid = c.uid;
+      btn.onclick = () => delCard(c);
+    });
+  } catch (e) { toast(e.message, true); }
+}
+
+async function delCard(c) {
+  if (!confirm('Delete the card for ' + c.name + ' (' + c.uid + ')?')) return;
+  try { await api('/api/cards?uid=' + encodeURIComponent(c.uid), { method: 'DELETE' }); toast('Card deleted'); loadCards(); }
+  catch (e) { toast(e.message, true); }
+}
+
+$('#cardForm').onsubmit = async ev => {
+  ev.preventDefault();
+  try {
+    await api('/api/cards', { method: 'POST', body: { uid: $('#cUid').value, name: $('#cName').value, chat: $('#cChat').value } });
+    toast('Card saved to the device');
+    ev.target.reset(); $('#scanMsg').textContent = '';
+    loadCards();
+  } catch (e) { toast(e.message, true); }
+};
+
+let scanTimer = null;
+$('#btnScan').onclick = async () => {
+  try {
+    await api('/api/scan/start', { method: 'POST', body: {} });
+    $('#btnScan').disabled = true;
+    $('#scanMsg').textContent = 'Hold the card on the reader…';
+    const poll = async () => {
+      try {
+        const s = await api('/api/scan');
+        if (s.uid) {
+          $('#cUid').value = s.uid;
+          if (s.known) { $('#cName').value = s.name; $('#cChat').value = s.chat; }
+          $('#scanMsg').textContent = s.known ? 'Card already saved. Saving will update it.' : 'Card read. Add the owner name and save.';
+          $('#btnScan').disabled = false; $('#cName').focus(); return;
+        }
+        if (!s.active) { $('#scanMsg').textContent = 'No card read. Try again.'; $('#btnScan').disabled = false; return; }
+        $('#scanMsg').textContent = 'Hold the card on the reader… ' + s.left + ' s';
+        scanTimer = setTimeout(poll, 700);
+      } catch (e) { $('#btnScan').disabled = false; toast(e.message, true); }
+    };
+    poll();
+  } catch (e) { toast(e.message, true); }
+};
+
+async function loadConfig() {
+  try {
+    const c = await api('/api/config');
+    $('#fSlot').value = c.slot; $('#fUser').value = c.user; $('#fRate').value = c.rate;
+    $('#fCar').value = c.carCm; $('#fClear').value = c.clearCm; $('#fConfirm').value = c.confirmMs;
+    $('#fChat').value = c.chatId; $('#fGuest').value = c.guestChat;
+  } catch (e) { toast(e.message, true); }
+}
+
+$('#cfgForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const body = {
+    slot: $('#fSlot').value, user: $('#fUser').value, rate: +$('#fRate').value,
+    carCm: +$('#fCar').value, clearCm: +$('#fClear').value, confirmMs: +$('#fConfirm').value,
+    chatId: $('#fChat').value, guestChat: $('#fGuest').value,
+    botToken: $('#fToken').value, dashPin: $('#fPin').value
+  };
+  try {
+    await api('/api/config', { method: 'POST', body });
+    if (body.dashPin) { pin = body.dashPin; sessionStorage.setItem('pin', pin); }
+    $('#fToken').value = ''; $('#fPin').value = '';
+    toast('Settings saved');
+  } catch (e) { toast(e.message, true); }
+};
+
+$('#btnTest').onclick = async () => {
+  $('#btnTest').disabled = true;
+  try { await api('/api/test', { method: 'POST', body: {} }); toast('Test message sent'); }
+  catch (e) { toast(e.message, true); }
+  $('#btnTest').disabled = false;
+};
+
+$('#btnReboot').onclick = async () => {
+  if (!confirm('Restart the ESP32? The dashboard will reconnect in a few seconds.')) return;
+  try { await api('/api/reboot', { method: 'POST', body: {} }); toast('Restarting…'); } catch (e) { toast(e.message, true); }
+};
+
+(async () => {
+  try { await api('/api/status'); } catch (e) {}
+  loadCards(); loadConfig(); pollStatus();
+})();
+</script>
+</body>
+</html>
+)rawliteral";
+
+static void sendJson(int code, JsonDocument& doc) {
+  String out;
+  serializeJson(doc, out);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(code, "application/json", out);
+}
+
+static void sendError(int code, const char* msg) {
+  JsonDocument d;
+  d["error"] = msg;
+  sendJson(code, d);
+}
+
+static bool authed() {
+  if (dashPin.length() > 0 && server.header("X-Pin") != dashPin) {
+    sendError(401, "PIN required or wrong");
+    return false;
+  }
+  return true;
+}
+
+static bool readBody(JsonDocument& doc) {
+  if (deserializeJson(doc, server.arg("plain")) != DeserializationError::Ok) {
+    sendError(400, "Invalid JSON");
+    return false;
+  }
+  return true;
+}
+
+// MFRC522 UIDs are 4, 7 or 10 bytes -> 8, 14 or 20 hex characters.
+static bool isValidUid(const String& s) {
+  if (s.length() < 8 || s.length() > 20 || (s.length() % 2) != 0) {
+    return false;
+  }
+  for (unsigned int i = 0; i < s.length(); i++) {
+    if (!isxdigit((unsigned char)s[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool deleteCard(const String& uid) {
+  int slot = findCard(uid);
+
+  if (slot < 0) {
+    return false;
+  }
+
+  const char* prefixes[] = {"cuid", "cname", "cchat"};
+
+  for (const char* p : prefixes) {
+    String key = String(p) + String(slot);
+
+    if (prefs.isKey(key.c_str())) {
+      prefs.remove(key.c_str());
+    }
+  }
+
+  return true;
+}
+
+// ---------- API handlers ----------
+
+static void apiStatus() {
+  if (!authed()) return;
+
+  JsonDocument d;
+
+  d["slot"] = cfg.slot;
+  d["user"] = cfg.userName;
+  d["parked"] = parked;
+  d["pending"] = pendingTicket;
+
+  if (pendingTicket) {
+    uint32_t elapsed = millis() - pendingStart;
+    d["pendingLeft"] = elapsed >= CARD_WINDOW_MS
+      ? 0 : (unsigned long)((CARD_WINDOW_MS - elapsed) / 1000UL);
+  }
+
+  if (lastDistanceValid) {
+    d["distance"] = roundf(lastDistanceCm * 10.0f) / 10.0f;
+  } else {
+    d["distance"] = nullptr;
+  }
+
+  d["owner"] = sessionOwner;
+  d["card"] = sessionCard;
+  d["ticket"] = ticketNo;
+  d["free"] = sessionFree;
+  d["rate"] = cfg.ratePerHour;
+  d["entry"] = (uint32_t)entryTime;
+  d["entryText"] = entryTime > 0 ? fmtTime(entryTime) : String("");
+  d["now"] = (uint32_t)time(nullptr);
+  d["timeOk"] = timeIsValid();
+  d["rfidOk"] = rfidOk;
+  d["botSet"] = cfg.botToken.length() > 0 &&
+                cfg.botToken != "PASTE_YOUR_NEW_BOT_TOKEN_HERE";
+  d["chatSet"] = cfg.chatId.length() > 0;
+  d["ssid"] = WiFi.SSID();
+  d["ip"] = WiFi.localIP().toString();
+  d["rssi"] = WiFi.RSSI();
+
+  sendJson(200, d);
+}
+
+static void apiCardsGet() {
+  if (!authed()) return;
+
+  JsonDocument d;
+  JsonArray arr = d["cards"].to<JsonArray>();
+
+  for (uint8_t i = 0; i < MAX_CARDS; i++) {
+    String uid = cardField("cuid", i);
+
+    if (uid.length() == 0) {
+      continue;
+    }
+
+    JsonObject o = arr.add<JsonObject>();
+    o["uid"] = uid;
+    o["name"] = cardField("cname", i);
+    o["chat"] = cardField("cchat", i);
+  }
+
+  d["max"] = MAX_CARDS;
+  sendJson(200, d);
+}
+
+static void apiCardSave() {
+  if (!authed()) return;
+
+  JsonDocument doc;
+  if (!readBody(doc)) return;
+
+  String uid = doc["uid"] | "";
+  String name = doc["name"] | "";
+  String chat = doc["chat"] | "";
+
+  uid.replace(":", "");
+  uid.replace(" ", "");
+  uid.trim();
+  uid.toUpperCase();
+  name.trim();
+  chat.trim();
+
+  if (!isValidUid(uid)) {
+    sendError(400, "Card ID must be 8, 14 or 20 hex characters (e.g. 04A1B2C3)");
+    return;
+  }
+
+  if (name.length() == 0 || name.length() > 31) {
+    sendError(400, "Owner name must be 1 to 31 characters");
+    return;
+  }
+
+  if (chat.length() > 0 && !isValidChatId(chat)) {
+    sendError(400, "Chat ID must be a number, e.g. 123456789");
+    return;
+  }
+
+  if (!saveCard(uid, name, chat)) {
+    sendError(409, "Card list is full. Delete a card first.");
+    return;
+  }
+
+  Serial.println("[WEB] Card saved: " + uid + " -> " + name);
+
+  JsonDocument d;
+  d["ok"] = true;
+  sendJson(200, d);
+}
+
+static void apiCardDelete() {
+  if (!authed()) return;
+
+  String uid = server.arg("uid");
+  uid.toUpperCase();
+
+  if (!deleteCard(uid)) {
+    sendError(404, "Card not found");
+    return;
+  }
+
+  Serial.println("[WEB] Card deleted: " + uid);
+
+  JsonDocument d;
+  d["ok"] = true;
+  sendJson(200, d);
+}
+
+static void apiScanStart() {
+  if (!authed()) return;
+
+  if (!rfidOk) {
+    sendError(400, "RFID reader not detected. Check wiring and restart.");
+    return;
+  }
+
+  scanActive = true;
+  scanStart = millis();
+  scanUid = "";
+
+  JsonDocument d;
+  d["ok"] = true;
+  sendJson(200, d);
+}
+
+static void apiScanGet() {
+  if (!authed()) return;
+
+  JsonDocument d;
+  d["active"] = scanActive;
+  d["uid"] = scanUid;
+
+  if (scanActive) {
+    uint32_t elapsed = millis() - scanStart;
+    d["left"] = elapsed >= SCAN_WINDOW_MS
+      ? 0 : (unsigned long)((SCAN_WINDOW_MS - elapsed) / 1000UL);
+  }
+
+  if (scanUid.length() > 0) {
+    d["known"] = findCard(scanUid) >= 0;
+    d["name"] = cardOwner(scanUid);
+    d["chat"] = cardChat(scanUid);
+  }
+
+  sendJson(200, d);
+}
+
+static void apiConfigGet() {
+  if (!authed()) return;
+
+  JsonDocument d;
+  d["slot"] = cfg.slot;
+  d["user"] = cfg.userName;
+  d["carCm"] = cfg.carCm;
+  d["clearCm"] = cfg.clearCm;
+  d["confirmMs"] = cfg.confirmMs;
+  d["rate"] = cfg.ratePerHour;
+  d["chatId"] = cfg.chatId;
+  d["guestChat"] = guestChat;
+  sendJson(200, d);
+}
+
+static void apiConfigSave() {
+  if (!authed()) return;
+
+  JsonDocument doc;
+  if (!readBody(doc)) return;
+
+  String slot = doc["slot"] | cfg.slot.c_str();
+  String user = doc["user"] | cfg.userName.c_str();
+  String chat = doc["chatId"] | cfg.chatId.c_str();
+  String guest = doc["guestChat"] | guestChat.c_str();
+  String token = doc["botToken"] | "";
+  String newPin = doc["dashPin"] | "";
+
+  float car = doc["carCm"] | cfg.carCm;
+  float clear = doc["clearCm"] | cfg.clearCm;
+  uint32_t confirm = doc["confirmMs"] | cfg.confirmMs;
+  uint32_t rate = doc["rate"] | cfg.ratePerHour;
+
+  slot.trim();
+  user.trim();
+  chat.trim();
+  guest.trim();
+  token.trim();
+  newPin.trim();
+
+  if (slot.length() == 0 || slot.length() > 15 ||
+      user.length() == 0 || user.length() > 39) {
+    sendError(400, "Slot (max 15) and user name (max 39) are required");
+    return;
+  }
+
+  if (!isfinite(car) || !isfinite(clear) ||
+      car < 2.0f || car > 350.0f ||
+      clear <= car || clear > 400.0f) {
+    sendError(400, "Thresholds: arrival 2-350 cm, departure must be larger (max 400)");
+    return;
+  }
+
+  if (confirm < 500 || confirm > 60000 || rate > 1000000UL) {
+    sendError(400, "Confirmation must be 500-60000 ms and fare at most 1000000");
+    return;
+  }
+
+  if (chat.length() > 0 && !isValidChatId(chat)) {
+    sendError(400, "Admin chat ID must be a number");
+    return;
+  }
+
+  if (guest.length() > 0 && !isValidChatId(guest)) {
+    sendError(400, "Guest chat ID must be a number");
+    return;
+  }
+
+  if (token.length() > 0 && (token.length() < 30 || token.indexOf(':') < 0)) {
+    sendError(400, "That does not look like a Telegram bot token");
+    return;
+  }
+
+  if (newPin.length() > 0 && (newPin.length() < 4 || newPin.length() > 12)) {
+    sendError(400, "PIN must be 4 to 12 characters");
+    return;
+  }
+
+  cfg.slot = slot;
+  cfg.userName = user;
+  cfg.chatId = chat;
+  cfg.carCm = car;
+  cfg.clearCm = clear;
+  cfg.confirmMs = confirm;
+  cfg.ratePerHour = rate;
+
+  if (token.length() > 0) {
+    cfg.botToken = token;
+  }
+
+  saveConfig();
+
+  guestChat = guest;
+  prefs.putString("guestchat", guestChat);
+
+  if (newPin.length() > 0) {
+    dashPin = newPin;
+    prefs.putString("dashpin", dashPin);
+  }
+
+  sensorInitialized = false;   // re-evaluate with the new thresholds
+  lastSensorRead = millis();
+
+  Serial.println("[WEB] Settings saved.");
+
+  JsonDocument d;
+  d["ok"] = true;
+  sendJson(200, d);
+}
+
+static void apiTest() {
+  if (!authed()) return;
+
+  if (cfg.chatId.length() == 0) {
+    sendError(400, "Set the admin Telegram chat ID first");
+    return;
+  }
+
+  bool ok = sendTelegram("Dashboard test message. Slot " + cfg.slot +
+                         " is " + String(parked ? "occupied." : "free."));
+
+  if (!ok) {
+    sendError(502, "Telegram did not accept the message. Check token and chat ID.");
+    return;
+  }
+
+  JsonDocument d;
+  d["ok"] = true;
+  sendJson(200, d);
+}
+
+static void apiReboot() {
+  if (!authed()) return;
+
+  JsonDocument d;
+  d["ok"] = true;
+  sendJson(200, d);
+
+  delay(300);
+  ESP.restart();
+}
+
+// Called from loop(): waits for a card while the dashboard scan is active.
+void updateScan() {
+  if (!scanActive) {
+    return;
+  }
+
+  const uint32_t now = millis();
+
+  if ((uint32_t)(now - scanStart) >= SCAN_WINDOW_MS) {
+    scanActive = false;
+    return;
+  }
+
+  if ((uint32_t)(now - lastRfidPoll) < RFID_POLL_MS) {
+    return;
+  }
+
+  lastRfidPoll = now;
+
+  String uid;
+
+  if (readCardUid(uid)) {
+    scanUid = uid;
+    scanActive = false;
+    Serial.println("[WEB] Scanned card: " + uid);
+  }
+}
+
+void startWebServer() {
+  dashPin = prefs.isKey("dashpin")
+    ? prefs.getString("dashpin", DEFAULT_DASH_PIN)
+    : String(DEFAULT_DASH_PIN);
+
+  if (dashPin.length() == 0) {
+    dashPin = DEFAULT_DASH_PIN;
+  }
+
+  if (MDNS.begin("parking")) {
+    MDNS.addService("http", "tcp", 80);
+  }
+
+  static const char* headerKeys[] = {"X-Pin"};
+  server.collectHeaders(headerKeys, 1);
+
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", DASH_HTML);
+  });
+
+  server.on("/api/status", HTTP_GET, apiStatus);
+  server.on("/api/cards", HTTP_GET, apiCardsGet);
+  server.on("/api/cards", HTTP_POST, apiCardSave);
+  server.on("/api/cards", HTTP_DELETE, apiCardDelete);
+  server.on("/api/scan/start", HTTP_POST, apiScanStart);
+  server.on("/api/scan", HTTP_GET, apiScanGet);
+  server.on("/api/config", HTTP_GET, apiConfigGet);
+  server.on("/api/config", HTTP_POST, apiConfigSave);
+  server.on("/api/test", HTTP_POST, apiTest);
+  server.on("/api/reboot", HTTP_POST, apiReboot);
+
+  server.onNotFound([]() {
+    sendError(404, "Not found");
+  });
+
+  server.begin();
+
+  Serial.println("[WEB] Dashboard: http://parking.local/  or  http://" +
+                 WiFi.localIP().toString() + "/");
+  Serial.println("[WEB] Default PIN is " + String(DEFAULT_DASH_PIN) +
+                 " (change it in Settings).");
+
+  // Send the dashboard address to Telegram so it can be opened from a phone.
+  if (cfg.chatId.length() > 0 &&
+      cfg.botToken.length() > 0 &&
+      cfg.botToken != "PASTE_YOUR_NEW_BOT_TOKEN_HERE") {
+    sendTelegram("Parking dashboard is online: http://" +
+                 WiFi.localIP().toString() + "/");
   }
 }
 
@@ -1100,6 +2101,7 @@ void setup() {
   Serial.println("  s = Show current settings");
   Serial.println("  r = Register an RFID card");
   Serial.println("  l = List registered cards");
+  Serial.println("  g = Set the guest chat ID (unregistered cards)");
   Serial.println("  x = Delete all registered cards");
 
   SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, RFID_SS_PIN);
@@ -1119,6 +2121,7 @@ void setup() {
   }
 
   initializeTime();
+  startWebServer();
 
   Serial.println("[SYSTEM] Parking system ready.");
 
@@ -1148,7 +2151,9 @@ void loop() {
     }
   }
 
+  server.handleClient();
   updateParkingDetection();
+  updateScan();
   updateRfid();
 
   delay(2);
